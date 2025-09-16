@@ -261,26 +261,17 @@ systemctl start ssh
 log_step "8. Nginx kuruluyor ve SSL sertifikası oluşturuluyor..."
 apt install -y nginx certbot python3-certbot-nginx
 
-# Nginx konfigürasyonu
+# Önce basit HTTP konfigürasyonu
 cat > /etc/nginx/sites-available/${DOMAIN} << EOF
 server {
     listen 80;
     server_name ${DOMAIN} www.${DOMAIN};
-    return 301 https://\$server_name\$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name ${DOMAIN} www.${DOMAIN};
-
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
     
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache shared:SSL:10m;
-
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+    }
+    
     location / {
         proxy_pass http://127.0.0.1:3333;
         proxy_set_header Host \$host;
@@ -295,44 +286,42 @@ EOF
 ln -sf /etc/nginx/sites-available/${DOMAIN} /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 
-# Nginx'i yeniden başlat
-systemctl restart nginx
+# Nginx'i başlat
+systemctl start nginx
 systemctl enable nginx
 
 # SSL sertifikası al (non-interactive)
 log_step "9. Let's Encrypt SSL sertifikası alınıyor..."
-certbot --nginx -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email admin@${DOMAIN} --redirect
+certbot --nginx -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email admin@${DOMAIN} --redirect || {
+    log_warning "SSL sertifikası alınamadı, sadece HTTP modunda devam ediliyor"
+}
 
 # 10. Gophish kurulumu
 log_step "10. Gophish kuruluyor..."
 
-# Go kurulumu
-cd /tmp
-wget -q https://golang.org/dl/go1.21.5.linux-amd64.tar.gz
-tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
-export PATH=$PATH:/usr/local/go/bin
-echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
-
 # Gophish kullanıcısı oluştur
-useradd -m -s /bin/bash gophish
+useradd -m -s /bin/bash gophish || true
 
-# Gophish kaynak kodunu indir ve derle
-cd /opt
-git clone https://github.com/gophish/gophish.git
-cd gophish
-/usr/local/go/bin/go build
+# Gophish binary'sini indir
+cd /tmp
+wget -q https://github.com/gophish/gophish/releases/download/v0.12.1/gophish-v0.12.1-linux-64bit.zip
+unzip -q gophish-v0.12.1-linux-64bit.zip
+mkdir -p /opt/gophish
+mv gophish /opt/gophish/
+chmod +x /opt/gophish/gophish
 
 # Gophish konfigürasyon dosyası
+cd /opt/gophish
 cat > config.json << EOF
 {
 	"admin_server": {
-		"listen_url": "0.0.0.0:92",
-		"use_tls": true,
+		"listen_url": "127.0.0.1:3333",
+		"use_tls": false,
 		"cert_path": "gophish_admin.crt",
 		"key_path": "gophish_admin.key"
 	},
 	"phish_server": {
-		"listen_url": "0.0.0.0:91",
+		"listen_url": "0.0.0.0:80",
 		"use_tls": false,
 		"cert_path": "example.crt",
 		"key_path": "example.key"
@@ -340,7 +329,7 @@ cat > config.json << EOF
 	"db_name": "sqlite3",
 	"db_path": "gophish.db",
 	"migrations_prefix": "db/db_",
-	"contact_address": "",
+	"contact_address": "admin@${DOMAIN}",
 	"logging": {
 		"filename": "gophish.log",
 		"level": "info"
@@ -350,7 +339,6 @@ EOF
 
 # İzinleri ayarla
 chown -R gophish:gophish /opt/gophish
-chmod +x /opt/gophish/gophish
 
 # Systemd service dosyası oluştur
 cat > /etc/systemd/system/gophish.service << EOF
@@ -372,19 +360,30 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
 
-# Gophish servisini enable et ve başlat
+# 11. OpenDKIM servisini düzelt ve servisleri başlat
+log_step "11. OpenDKIM sorunları düzeltiliyor..."
+
+# OpenDKIM socket sorununu düzelt
+systemctl stop opendkim || true
+rm -rf /var/spool/postfix/opendkim
+mkdir -p /var/spool/postfix/opendkim
+chown opendkim:postfix /var/spool/postfix/opendkim
+
+# OpenDKIM'i yeniden başlat
+systemctl start opendkim
+systemctl enable opendkim
+
+# Postfix'i yeniden başlat
+systemctl restart postfix
+systemctl enable postfix
+
+# Gophish servisini başlat
 systemctl daemon-reload
+systemctl start gophish
 systemctl enable gophish
 
-# 11. Servisleri yeniden başlat
-log_step "11. Tüm servisler yeniden başlatılıyor..."
-systemctl restart opendkim
-systemctl restart postfix
-systemctl start gophish
-
 # Servislerin durumunu kontrol et
-systemctl enable opendkim
-systemctl enable postfix
+sleep 5
 
 # 12. Test ve bilgilendirme
 log_step "12. Kurulum tamamlandı!"
@@ -424,7 +423,12 @@ echo ""
 echo -e "${BLUE}3. Gophish Erişimi:${NC}"
 echo ""
 echo -e "${GREEN}Admin Panel:${NC}"
-echo -e "   URL: https://${DOMAIN}/login"
+if [ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
+    echo -e "   URL: https://${DOMAIN}/login"
+else
+    echo -e "   URL: http://${DOMAIN}/login"
+    log_warning "SSL sertifikası yok, HTTP kullanılıyor"
+fi
 echo -e "   İlk giriş için şifre gophish.log dosyasında görünecek:"
 echo -e "   tail -f /opt/gophish/gophish.log | grep 'Please login with'"
 echo ""
