@@ -274,30 +274,33 @@ server {
     
     # Admin panel
     location /login {
-        proxy_pass http://127.0.0.1:3333/login;
+        proxy_pass https://127.0.0.1:92/login;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_ssl_verify off;
     }
     
     # Admin panel static files
     location /static/ {
-        proxy_pass http://127.0.0.1:3333/static/;
+        proxy_pass https://127.0.0.1:92/static/;
         proxy_set_header Host \$host;
+        proxy_ssl_verify off;
     }
     
     # Admin panel API
     location /api/ {
-        proxy_pass http://127.0.0.1:3333/api/;
+        proxy_pass https://127.0.0.1:92/api/;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_ssl_verify off;
     }
     
     # Phishing pages
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:91;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -323,39 +326,60 @@ certbot --nginx -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --em
 # 10. Gophish kurulumu
 log_step "10. Gophish kuruluyor..."
 
-# Gerekli paketleri kur
-apt install -y git golang-go build-essential
+# Gerekli paketleri kur (unzip gerekli)
+apt install -y unzip wget
 
-# Root altında Gophish klon et
-cd /root
-git clone https://github.com/gophish/gophish.git
-cd gophish
+# Gophish'in en son sürümünü indir
+GOPHISH_VERSION="v0.12.1"
+GOPHISH_URL="https://github.com/gophish/gophish/releases/download/${GOPHISH_VERSION}/gophish-${GOPHISH_VERSION}-linux-64bit.zip"
 
-# Gophish'i derle
-go build
+cd /tmp
+log_step "Gophish ${GOPHISH_VERSION} indiriliyor..."
+if wget -q --show-progress "${GOPHISH_URL}"; then
+    log_success "Gophish başarıyla indirildi"
+else
+    log_error "Gophish indirilemedi"
+    exit 1
+fi
 
-# Gophish için klasör oluştur ve dosyaları kopyala
+# Zip dosyasını çıkar ve /opt/gophish dizinine kur
 mkdir -p /opt/gophish
-cp gophish /opt/gophish/
-cp -r static /opt/gophish/
-cp -r templates /opt/gophish/
-cp -r db /opt/gophish/
+log_step "Gophish çıkarılıyor..."
+if unzip -q gophish-${GOPHISH_VERSION}-linux-64bit.zip -d /opt/gophish; then
+    log_success "Gophish başarıyla çıkarıldı"
+else
+    log_error "Gophish çıkarılamadı"
+    exit 1
+fi
+
+# Geçici dosyayı temizle
+rm -f /tmp/gophish-${GOPHISH_VERSION}-linux-64bit.zip
+
+# Gophish binary'sinin varlığını kontrol et
+if [ ! -f "/opt/gophish/gophish" ]; then
+    log_error "Gophish binary dosyası bulunamadı"
+    exit 1
+fi
 
 # Gophish kullanıcısı oluştur
 useradd -r -s /bin/false gophish || true
+
+# Log dizini oluştur
+mkdir -p /var/log/gophish
 
 # Gophish konfigürasyon dosyası
 cd /opt/gophish
 cat > config.json << EOF
 {
 	"admin_server": {
-		"listen_url": "127.0.0.1:3333",
-		"use_tls": false,
+		"listen_url": "0.0.0.0:92",
+		"use_tls": true,
 		"cert_path": "gophish_admin.crt",
-		"key_path": "gophish_admin.key"
+		"key_path": "gophish_admin.key",
+		"trusted_origins": []
 	},
 	"phish_server": {
-		"listen_url": "127.0.0.1:8080",
+		"listen_url": "0.0.0.0:91",
 		"use_tls": false,
 		"cert_path": "example.crt",
 		"key_path": "example.key"
@@ -363,22 +387,36 @@ cat > config.json << EOF
 	"db_name": "sqlite3",
 	"db_path": "gophish.db",
 	"migrations_prefix": "db/db_",
-	"contact_address": "admin@${DOMAIN}",
+	"contact_address": "",
 	"logging": {
-		"filename": "gophish.log",
-		"level": "info"
+		"filename": "",
+		"level": ""
 	}
 }
 EOF
 
 # İzinleri ayarla
-chown -R gophish:gophish /opt/gophish
+chown -R gophish:gophish /opt/gophish /var/log/gophish
 chmod +x /opt/gophish/gophish
+
+# Gophish admin panel için self-signed SSL sertifikası oluştur
+log_step "Gophish admin panel SSL sertifikası oluşturuluyor..."
+cd /opt/gophish
+openssl req -newkey rsa:2048 -nodes -keyout gophish_admin.key -x509 -days 365 -out gophish_admin.crt -subj "/C=US/ST=State/L=City/O=Organization/CN=${DOMAIN}"
+
+# SSL sertifikalarının sahipliğini ayarla
+chown gophish:gophish gophish_admin.key gophish_admin.crt
+chmod 600 gophish_admin.key
+chmod 644 gophish_admin.crt
+
+# Port 80 ve 443 için gerekli yetkiyi ver (düşük portlara bind olabilmek için)
+setcap cap_net_bind_service=+ep /opt/gophish/gophish
 
 # Systemd service dosyası oluştur
 cat > /etc/systemd/system/gophish.service << EOF
 [Unit]
-Description=Gophish Phishing Framework
+Description=Gophish is an open-source phishing toolkit
+Documentation=https://getgophish.com/documentation/
 After=network.target
 Wants=network.target
 
@@ -387,13 +425,18 @@ Type=simple
 User=gophish
 Group=gophish
 WorkingDirectory=/opt/gophish
-ExecStart=/opt/gophish/gophish
+Environment=HOME=/opt/gophish
+Environment=STDOUT=/var/log/gophish/gophish.log
+Environment=STDERR=/var/log/gophish/gophish.log
+ExecStart=/bin/sh -c "/opt/gophish/gophish >>\${STDOUT} 2>>\${STDERR}"
 Restart=on-failure
 RestartSec=5s
-Environment=HOME=/opt/gophish
+StandardOutput=append:/var/log/gophish/gophish.log
+StandardError=append:/var/log/gophish/gophish.log
 
 [Install]
 WantedBy=multi-user.target
+Alias=gophish.service
 EOF
 
 # 11. OpenDKIM sorunlarını çöz
@@ -438,9 +481,17 @@ systemctl restart postfix
 systemctl enable postfix
 
 # Gophish servisini başlat
+log_step "Gophish servisi başlatılıyor..."
 systemctl daemon-reload
-systemctl start gophish
-systemctl enable gophish
+
+if systemctl start gophish; then
+    log_success "Gophish servisi başarıyla başlatıldı"
+    systemctl enable gophish
+    log_success "Gophish servisi otomatik başlatma için etkinleştirildi"
+else
+    log_error "Gophish servisi başlatılamadı"
+    journalctl -xeu gophish.service --no-pager -n 10
+fi
 
 # Servislerin durumunu kontrol et
 sleep 5
@@ -525,8 +576,9 @@ else
     echo -e "   URL: http://${DOMAIN}/login"
     log_warning "SSL sertifikası yok, HTTP kullanılıyor"
 fi
-echo -e "   İlk giriş için şifre gophish.log dosyasında görünecek:"
-echo -e "   tail -f /opt/gophish/gophish.log | grep 'Please login with'"
+echo -e "   Direkt Erişim (Port 92): https://${DOMAIN}:92"
+echo -e "   İlk giriş için şifre terminalde görünecek veya log'larda:"
+echo -e "   journalctl -u gophish -f | grep 'Please login with'"
 echo ""
 echo -e "${GREEN}Gophish Servis Yönetimi:${NC}"
 echo -e "   Başlat: systemctl start gophish"
@@ -555,14 +607,12 @@ echo -e "• mail-tester.com ile email score testini yapın"
 echo -e "• Konfigürasyon dosyaları yedeklendi (.backup uzantısı ile)"
 echo ""
 echo -e "${YELLOW}=== İLAVE NOTLAR ===${NC}"
-echo -e "• Gophish ilk şifresi gophish.log dosyasında görünecek"
+echo -e "• Gophish admin panel TLS ile güvenli (port 92)"
+echo -e "• Phishing server HTTP (port 91)"
+echo -e "• Gophish ilk şifresi terminal çıktısında görünecek"
 echo -e "• SSL sertifikası otomatik yenilenecek"
 echo -e "• Nginx reverse proxy olarak Gophish'i yönlendiriyor"
 echo -e "• Tüm servisler sistem başlangıcında otomatik başlayacak"
-echo -e "• SSH servisi güvenlik için enable edildi"
-echo ""
-echo -e "${RED}⚠️  BU ARAÇ SADECE YETKİLİ GÜVENLİK TESTLERİ İÇİN KULLANILMALIDIR!${NC}"
-echo ""
 
 # Son kontroller
 log_step "Tüm servislerin durumları kontrol ediliyor..."
