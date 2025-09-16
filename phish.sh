@@ -272,8 +272,32 @@ server {
         allow all;
     }
     
+    # Admin panel
+    location /login {
+        proxy_pass http://127.0.0.1:3333/login;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    
+    # Admin panel static files
+    location /static/ {
+        proxy_pass http://127.0.0.1:3333/static/;
+        proxy_set_header Host \$host;
+    }
+    
+    # Admin panel API
+    location /api/ {
+        proxy_pass http://127.0.0.1:3333/api/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    
+    # Phishing pages
     location / {
-        proxy_pass http://127.0.0.1:3333;
+        proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -299,16 +323,26 @@ certbot --nginx -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --em
 # 10. Gophish kurulumu
 log_step "10. Gophish kuruluyor..."
 
-# Gophish kullanıcısı oluştur
-useradd -m -s /bin/bash gophish || true
+# Gerekli paketleri kur
+apt install -y git golang-go build-essential
 
-# Gophish binary'sini indir
-cd /tmp
-wget -q https://github.com/gophish/gophish/releases/download/v0.12.1/gophish-v0.12.1-linux-64bit.zip
-unzip -q gophish-v0.12.1-linux-64bit.zip
+# Root altında Gophish klon et
+cd /root
+git clone https://github.com/gophish/gophish.git
+cd gophish
+
+# Gophish'i derle
+go build
+
+# Gophish için klasör oluştur ve dosyaları kopyala
 mkdir -p /opt/gophish
-mv gophish /opt/gophish/
-chmod +x /opt/gophish/gophish
+cp gophish /opt/gophish/
+cp -r static /opt/gophish/
+cp -r templates /opt/gophish/
+cp -r db /opt/gophish/
+
+# Gophish kullanıcısı oluştur
+useradd -r -s /bin/false gophish || true
 
 # Gophish konfigürasyon dosyası
 cd /opt/gophish
@@ -321,7 +355,7 @@ cat > config.json << EOF
 		"key_path": "gophish_admin.key"
 	},
 	"phish_server": {
-		"listen_url": "0.0.0.0:80",
+		"listen_url": "127.0.0.1:8080",
 		"use_tls": false,
 		"cert_path": "example.crt",
 		"key_path": "example.key"
@@ -339,6 +373,7 @@ EOF
 
 # İzinleri ayarla
 chown -R gophish:gophish /opt/gophish
+chmod +x /opt/gophish/gophish
 
 # Systemd service dosyası oluştur
 cat > /etc/systemd/system/gophish.service << EOF
@@ -355,23 +390,48 @@ WorkingDirectory=/opt/gophish
 ExecStart=/opt/gophish/gophish
 Restart=on-failure
 RestartSec=5s
+Environment=HOME=/opt/gophish
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 11. OpenDKIM servisini düzelt ve servisleri başlat
+# 11. OpenDKIM sorunlarını çöz
 log_step "11. OpenDKIM sorunları düzeltiliyor..."
 
-# OpenDKIM socket sorununu düzelt
+# OpenDKIM'i durdur
 systemctl stop opendkim || true
-rm -rf /var/spool/postfix/opendkim
-mkdir -p /var/spool/postfix/opendkim
-chown opendkim:postfix /var/spool/postfix/opendkim
 
-# OpenDKIM'i yeniden başlat
+# Socket dosyasını ve klasörünü temizle
+rm -rf /var/spool/postfix/opendkim/*
+rm -f /var/run/opendkim/opendkim.sock
+
+# Socket klasörünü yeniden oluştur
+mkdir -p /var/spool/postfix/opendkim
+mkdir -p /var/run/opendkim
+chown opendkim:postfix /var/spool/postfix/opendkim
+chown opendkim:opendkim /var/run/opendkim
+
+# OpenDKIM konfigürasyonunu kontrol et
+if ! opendkim -n -f /etc/opendkim.conf; then
+    log_error "OpenDKIM konfigürasyonunda hata var"
+else
+    log_success "OpenDKIM konfigürasyonu doğru"
+fi
+
+# OpenDKIM'i başlat
 systemctl start opendkim
 systemctl enable opendkim
+
+# OpenDKIM başlayana kadar bekle
+sleep 3
+
+if systemctl is-active --quiet opendkim; then
+    log_success "OpenDKIM başarıyla başlatıldı"
+else
+    log_error "OpenDKIM başlatılamadı, manuel kontrol gerekli"
+    journalctl -xeu opendkim.service --no-pager -n 20
+fi
 
 # Postfix'i yeniden başlat
 systemctl restart postfix
@@ -419,6 +479,42 @@ echo ""
 echo -e "${GREEN}PTR (Reverse DNS) Kaydı:${NC}"
 echo -e "   IP: $(curl -s ifconfig.me 2>/dev/null || echo 'SUNUCU_IP_ADRESI')"
 echo -e "   Değer: ${MAIL_HOSTNAME}"
+echo ""
+echo -e "${RED}=== DNS KAYITLARINI GİRİN ===${NC}"
+echo -e "${YELLOW}Yukarıdaki DNS kayıtlarını domain yöneticinize (Cloudflare) girin.${NC}"
+echo -e "${YELLOW}DNS kayıtlarının yayılması birkaç dakika sürebilir.${NC}"
+echo ""
+read -p "DNS kayıtlarını girip propagation'ı beklediniz mi? (y/N): " -n 1 -r
+echo ""
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    log_step "DNS kayıtları kontrol ediliyor..."
+    
+    # DKIM test
+    log_step "DKIM kaydı test ediliyor..."
+    if opendkim-testkey -d ${DOMAIN} -s default -vvv 2>&1 | grep -q "key OK"; then
+        log_success "DKIM kaydı doğru şekilde ayarlanmış"
+    else
+        log_warning "DKIM kaydı henüz doğrulanamadı, lütfen birkaç dakika bekleyip manuel kontrol edin"
+    fi
+    
+    # MX test
+    log_step "MX kaydı test ediliyor..."
+    if dig +short MX ${DOMAIN} | grep -q "${MAIL_HOSTNAME}"; then
+        log_success "MX kaydı doğru şekilde ayarlanmış"
+    else
+        log_warning "MX kaydı bulunamadı veya henüz yayılmadı"
+    fi
+    
+    # SPF test
+    log_step "SPF kaydı test ediliyor..."
+    if dig +short TXT ${DOMAIN} | grep -q "spf1"; then
+        log_success "SPF kaydı doğru şekilde ayarlanmış"
+    else
+        log_warning "SPF kaydı bulunamadı veya henüz yayılmadı"
+    fi
+else
+    log_warning "DNS kayıtlarını girdikten sonra script'i yeniden çalıştırabilirsiniz"
+fi
 echo ""
 echo -e "${BLUE}3. Gophish Erişimi:${NC}"
 echo ""
